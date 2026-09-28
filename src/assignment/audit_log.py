@@ -26,8 +26,16 @@ class AuditLogPlugin:
         self._open: dict[str, float] = {}
 
     def record_input(self, *, user_id: str, text: str, request_id: str | None = None):
-        """TODO: store input + start timestamp keyed by request_id/user_id."""
-        raise NotImplementedError("Implement AuditLogPlugin.record_input")
+        """Store input + start timestamp keyed by request_id/user_id."""
+        key = request_id or user_id
+        import time
+        self._open[key] = {
+            "user_id": user_id,
+            "request_id": request_id,
+            "input": text,
+            "start_time": time.time(),
+            "timestamp": utc_now_iso(),
+        }
 
     def record_output(
         self,
@@ -38,15 +46,30 @@ class AuditLogPlugin:
         layer: str | None = None,
         request_id: str | None = None,
     ):
-        """TODO: store output, layer decision, latency; append to self.logs."""
-        raise NotImplementedError("Implement AuditLogPlugin.record_output")
+        """Store output, layer decision, latency; append to self.logs."""
+        import time
+        key = request_id or user_id
+        start_info = self._open.pop(key, {})
+        start_time = start_info.get("start_time", time.time())
+        latency = round(time.time() - start_time, 4)
+
+        entry = {
+            "timestamp": start_info.get("timestamp") or utc_now_iso(),
+            "user_id": user_id,
+            "request_id": request_id,
+            "input": start_info.get("input", ""),
+            "output": text,
+            "blocked": blocked,
+            "layer": layer,
+            "latency_seconds": latency,
+        }
+        self.logs.append(entry)
 
     def export_json(self, filepath: str | None = None):
         """Write logs to disk (JSON array) under repo-root ``outputs/`` by default."""
-        # TODO: path = filepath or default_audit_log_path()
-        #       ensure parent dirs exist, dump self.logs with indent=2
-        _ = filepath or default_audit_log_path()
-        raise NotImplementedError("Implement AuditLogPlugin.export_json")
+        target = Path(filepath or default_audit_log_path())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.logs, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def utc_now_iso() -> str:

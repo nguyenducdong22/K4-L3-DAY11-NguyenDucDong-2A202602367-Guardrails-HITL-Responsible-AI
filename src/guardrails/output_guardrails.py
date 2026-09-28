@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from agents.security_boundary import contains_secret
 from core.utils import chat_with_agent
 
 
@@ -41,19 +42,33 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "password": r"(?:password|passwd|mật\s*khẩu|mat\s*khau)\s*[:=]\s*\S+|admin\s*123",
+        "api_key": r"sk-[a-zA-Z0-9-]+",
+        "db_host": r"db\.vinbank\.internal(?::\d+)?",
+        "email": r"\b[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+        # 0xxxxxxxxx / +84 xxx xxx xxx, with optional space / dot / dash separators
+        "phone": r"(?<![\d+])(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+        # CCCD: 12 digits starting with a 0 province code (plain amounts are left alone)
+        "national_id": r"\b0\d{11}\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # CMND/CCCD number announced by a label, e.g. "CMND: 123456789"
+    id_pattern = r"((?:cccd|cmnd|căn\s*cước|chứng\s*minh|national\s*id|id\s*card)\D{0,15})\d{9,12}\b"
+    if re.search(id_pattern, redacted, re.IGNORECASE):
+        issues.append("national_id: labelled number found")
+        redacted = re.sub(id_pattern, r"\1[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # A lab secret that survived the regexes is obfuscated ("a-d-m-i-n-1-2-3",
+    # "admin 1 2 3"): withhold the whole answer rather than guess what to cut.
+    if contains_secret(redacted):
+        issues.append("obfuscated_secret: found")
+        redacted = "[REDACTED] Response withheld: it contained protected internal data."
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +187,23 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            if hasattr(llm_response, "content") and llm_response.content:
+                llm_response.content.parts = [types.Part.from_text(text=filter_result["redacted"])]
+            response_text = filter_result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_res = await llm_safety_check(response_text)
+            if not judge_res.get("safe", True):
+                self.blocked_count += 1
+                if hasattr(llm_response, "content") and llm_response.content:
+                    llm_response.content.parts = [
+                        types.Part.from_text(text="Blocked: Content safety policy violation.")
+                    ]
+
+        return llm_response
 
 
 # ============================================================
